@@ -15,6 +15,7 @@
 - [Quick Start](#quick-start)
 - [Installation](#installation)
 - [Configuration](#configuration)
+- [Understanding MSAL Authentication](#-understanding-msal-authentication)
 - [Usage](#usage)
 - [Deployment](#deployment)
 - [Troubleshooting](#troubleshooting)
@@ -205,7 +206,178 @@ Policy Settings:
     - Min OS version: iOS 14+, Android 10+
 ```
 
-## 💻 Usage
+## � Understanding MSAL Authentication
+
+### What is MSAL and Why is it Required for Intune?
+
+**Microsoft Authentication Library (MSAL)** is a library that allows your application to integrate with the Microsoft identity platform. It's **essential** for Intune MAM because policies are applied based on the user's authenticated identity in Azure Active Directory.
+
+#### Why MSAL is Critical for Intune Integration
+
+1. **Identity Verification**: Your app must first determine *who* is using it. MSAL handles the sign-in process against your company's Azure AD.
+
+2. **Policy Enrollment**: Once a user is successfully signed in, the Intune SDK uses their authenticated identity (specifically, their User Principal Name or UPN, like `user@yourcompany.com`) to communicate with the Microsoft Intune service.
+
+3. **Policy Retrieval**: The Intune service checks if any App Protection Policies are assigned to that specific user or a group they belong to.
+
+4. **Policy Enforcement**: If policies exist, the Intune service sends them to the SDK in your app, which then enforces the rules you configured.
+
+> **Without MSAL**: The Intune SDK wouldn't know which user to check for policies, and no protection would be applied.
+
+### The Authentication Flow Explained
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant App
+    participant MSAL
+    participant AzureAD
+    participant IntuneSDK
+    participant IntuneService
+
+    User->>App: Opens app and clicks "Sign In"
+    App->>MSAL: initiate authentication
+    MSAL->>AzureAD: redirect to corporate login
+    User->>AzureAD: enters credentials (+ MFA)
+    AzureAD->>MSAL: returns access token
+    MSAL->>App: authentication success
+    App->>IntuneSDK: user authenticated with corporate account
+    IntuneSDK->>IntuneService: check policies for user@company.com
+    IntuneService->>IntuneSDK: return applicable policies
+    IntuneSDK->>App: enforce policies (PIN, copy/paste restrictions, etc.)
+    App->>User: app now runs in managed mode
+```
+
+### Token Types and Their Purpose
+
+| Token Type | Purpose | Lifetime | Storage |
+|------------|---------|----------|---------|
+| **Access Token** | Proves user identity to APIs | 1 hour | Memory only |
+| **Refresh Token** | Gets new access tokens | 90 days | Secure keychain |
+| **ID Token** | Contains user profile info | 1 hour | Memory only |
+
+### Silent vs Interactive Authentication
+
+#### Silent Authentication
+```javascript
+// Attempt to get token without user interaction
+const silentRequest = { 
+  scopes: ['user.read', 'DeviceManagementManagedApps.ReadWrite'], 
+  account: accounts[0] 
+};
+const result = await pca.acquireTokenSilent(silentRequest);
+```
+
+**When it works**: User already signed in, token still valid
+**Benefits**: Seamless user experience, no interruption
+
+#### Interactive Authentication
+```javascript
+// Requires user interaction (login screen)
+const interactiveRequest = { 
+  scopes: ['user.read', 'DeviceManagementManagedApps.ReadWrite'] 
+};
+const result = await pca.acquireToken(interactiveRequest);
+```
+
+**When needed**: First sign-in, token expired, or consent required
+**Process**: Redirects to Azure AD login page
+
+### Scope Permissions Explained
+
+```javascript
+const scopes = [
+  'user.read',                           // Basic user profile
+  'DeviceManagementManagedApps.ReadWrite' // Intune MAM communication
+];
+```
+
+| Scope | Purpose | Required for Intune |
+|-------|---------|-------------------|
+| `user.read` | Access basic user profile information | Optional |
+| `DeviceManagementManagedApps.ReadWrite` | Allow app to report status to Intune service | **Required** |
+
+### Corporate vs Personal Account Handling
+
+#### Corporate Account Flow (`user@company.com`)
+1. User signs in with work email
+2. MSAL redirects to company's Azure AD
+3. User completes authentication (password + MFA)
+4. **Intune SDK activates** and checks for policies
+5. Policies are downloaded and enforced
+6. App runs in **Managed Mode**
+
+#### Personal Account Flow (`user@gmail.com`)
+1. User signs in with personal email
+2. MSAL authenticates against personal Microsoft account
+3. **Intune SDK remains dormant** (no corporate identity)
+4. App runs in **Unmanaged Mode**
+
+### Error Handling Best Practices
+
+```javascript
+export const signIn = async () => {
+  try {
+    // Try silent first
+    const accounts = await pca.getAccounts();
+    if (accounts.length > 0) {
+      try {
+        return await pca.acquireTokenSilent({ scopes, account: accounts[0] });
+      } catch (silentError) {
+        // Silent failed, fall back to interactive
+        console.log('Silent auth failed, trying interactive:', silentError.code);
+      }
+    }
+    
+    // Interactive authentication
+    return await pca.acquireToken({ scopes });
+  } catch (error) {
+    // Handle specific error codes
+    switch (error.code) {
+      case 'user_cancelled':
+        console.log('User cancelled authentication');
+        break;
+      case 'network_not_available':
+        throw new Error('Network connection required for sign-in');
+      case 'invalid_client':
+        throw new Error('App configuration error. Check client ID.');
+      default:
+        console.error('Authentication error:', error);
+        throw new Error('Authentication failed. Please try again.');
+    }
+  }
+};
+```
+
+### Security Considerations
+
+#### Token Storage
+- **Access tokens**: Stored in memory only
+- **Refresh tokens**: Stored in secure keychain (iOS) or keystore (Android)
+- **Never**: Store tokens in plain text or shared preferences
+
+#### Network Security
+```javascript
+// Always use HTTPS for token requests
+const msalConfig = {
+  auth: {
+    authority: 'https://login.microsoftonline.com/YOUR_TENANT_ID', // ✅ HTTPS
+    // authority: 'http://...' // ❌ Never use HTTP
+  },
+};
+```
+
+#### Certificate Pinning (Advanced)
+```javascript
+// Implement certificate pinning for production apps
+const networkConfig = {
+  certificatePinning: {
+    'login.microsoftonline.com': ['sha256/CERTIFICATE_HASH']
+  }
+};
+```
+
+## �💻 Usage
 
 ### Authentication Service
 
